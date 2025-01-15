@@ -1,142 +1,183 @@
 import json
-from utils.text_analyzer import TextAnalyzer
+import csv
+from collections import Counter
 
-CF_ALL_TERMS_EXPERT_LEVEL = 3443922
-Count_of_all_answers = 33670
-from elasticsearch import Elasticsearch
-from utils.elasticsearch import ElasticSearch as elasticsearch
+# 1. Load data and calculate total term statistics
+def load_and_calculate_statistics(file_path):
+    with open(file_path, "r") as f:
+        data = json.load(f)
 
-es = Elasticsearch(urls="http://localhost", port="9200", timeout=600)
-text_analyzer = TextAnalyzer()
+    document_term_frequencies = Counter()
+    total_terms = 0
+    total_answers = 0
 
-Sampling = False
-DOCUMENT_LEVEL_INDEX = "ef_legal_doc_level"
-DOCUMENT_LEVEL_FIELD = "content"
-queries_path = "../data/queries_bankruptcy.csv"
-queries = open(queries_path, "r").read().splitlines()
-if Sampling:
-    queries = [queries[0]]
+    for question_id, content in data.items():
+        for answer in content["answers"]:
+            text = answer["answer_text"]
+            words = text.split()
+            document_term_frequencies.update(words)
+            total_terms += len(words)
+            total_answers += 1
 
+    return data, document_term_frequencies, total_terms, total_answers
 
-def find_top_1000_answers_for_query(query):
-    es = elasticsearch()
-    query = query.lower()
-    bool_query = {
-        "size": 1000,
-        "query": {
-            "bool": {
-                "should": [{"match": {DOCUMENT_LEVEL_FIELD: query}}],
-                "minimum_should_match": 0,
-                "boost": 1.0,
-            }
-        },
-    }
-    answers = es.search(index=DOCUMENT_LEVEL_INDEX, body=bool_query)
-    return answers["hits"]["hits"]
+# 2. Calculate Ground Truth
+def calculate_ground_truth(data, category):
+    relevant_experts = Counter()
+    for question_id, content in data.items():
+        if category.lower() in [tag.lower() for tag in content.get("tags", [])]:
+            for answer in content["answers"]:
+                if answer.get("best_answer") or answer.get("lawyers_agreed", 0) >= 3:
+                    relevant_experts[answer["attorney_link"]] += 1
 
+    # Filter experts with at least 10 accepted answers
+    relevant_experts = [expert_id for expert_id, count in relevant_experts.items() if count >= 10]
+    return relevant_experts
 
-def find_an_doc_id_that_has_specific_query_term(term):
-    print("find_an_doc_id_that_has_specific_query_term term:", term)
-    es = elasticsearch()
-    term = term.lower()
-    bool_query = {
-        "size": 1,
-        "query": {
-            "bool": {"must": [{"term": {DOCUMENT_LEVEL_FIELD: term}}], "boost": 1.0}
-        },
-    }
-    candidates = es.search(index=DOCUMENT_LEVEL_INDEX, body=bool_query)
-    return candidates["hits"]["hits"][0]["_id"]
+# 3. Document-Level Probability Calculations
+def calculate_lambda_doc_level(doc_length, beta):
+    return beta / (beta + doc_length)
 
+def calculate_p_tc(term, term_frequencies, total_terms):
+    return term_frequencies.get(term, 0) / total_terms
 
-def get_p_tc_doclevel(query_input_term):
-    query_input_term = query_input_term.lower()
-    doc_id_for_calculate_stats = find_an_doc_id_that_has_specific_query_term(
-        query_input_term
-    )
-    body = {
-        "fields": [DOCUMENT_LEVEL_FIELD],
-        "offsets": True,
-        "positions": True,
-        "term_statistics": True,
-        "field_statistics": True,
-    }
-    res = es.termvectors(
-        index=DOCUMENT_LEVEL_INDEX, body=body, id=doc_id_for_calculate_stats
-    )
-    total_terms_fre_in_collection = CF_ALL_TERMS_EXPERT_LEVEL  # res["term_vectors"][EXPERT_LEVEL_FIELD]['field_statistics']['sum_ttf']
-    query_term_freq_in_collection = res["term_vectors"][DOCUMENT_LEVEL_FIELD]["terms"][
-        query_input_term
-    ]["ttf"]
-    p_tc_for_query_term = query_term_freq_in_collection / total_terms_fre_in_collection
-    return p_tc_for_query_term
+def calculate_document_score(query, document, term_frequencies, total_terms, beta):
+    words = document.split()
+    doc_length = len(words)
+    lambda_doc_level = calculate_lambda_doc_level(doc_length, beta)
 
+    score = 1
+    for term in query.split():
+        p_tc = calculate_p_tc(term, term_frequencies, total_terms)
+        p_td = words.count(term) / doc_length if doc_length > 0 else 0
+        term_score = (1 - lambda_doc_level) * p_td + lambda_doc_level * p_tc + 1e-10
+        score *= term_score
 
-candidates_scores_doclevel = (
-    {}
-)  # structure: {"expert_id": {"query":[{answerIDXofExpert:score}, ..., {answeridN:score}]} }
-docs_score_with_owner_candidate_id = (
-    {}
-)  # structure: {"query":[(doc_id, doc_score, expert_owner_id]}
-beta_doc_level = CF_ALL_TERMS_EXPERT_LEVEL / Count_of_all_answers
-p_tc_query_terms = {}
-for query in queries:
-    print("query: ", query)
-    top_1000_answers_for_query = find_top_1000_answers_for_query(query)
-    query_words = query.split(" ")
-    for answer in top_1000_answers_for_query:
-        owner_incremental_id = answer["_source"]["owner_incremental_id"]
-        answer_id = answer["_id"]
-        answer_text = answer["_source"][DOCUMENT_LEVEL_FIELD]
-        answer_text_list = answer_text.split(" ")
-        answer_len = len(answer_text_list)
-        n_d = answer_len
-        lambda_doc_level = beta_doc_level / (beta_doc_level + n_d)
-        if query not in candidates_scores_doclevel:
-            candidates_scores_doclevel[query] = {}
-            docs_score_with_owner_candidate_id[query] = []
-            candidates_scores_doclevel[query][
-                owner_incremental_id
-            ] = []  # list of tuple (answer_id, score)
-        if (
-            query in candidates_scores_doclevel
-            and owner_incremental_id not in candidates_scores_doclevel[query]
-        ):
-            candidates_scores_doclevel[query][
-                owner_incremental_id
-            ] = []  # list of tuple (answer_id, score)
-        total_score_for_this_query_term_to_this_doc = 1
-        for query_term in query_words:
-            if query_term in p_tc_query_terms:
-                p_tc = p_tc_query_terms[query_term]
-            else:
-                p_tc = 0
-                p_tc = get_p_tc_doclevel(query_term)
-                p_tc_query_terms[query_term] = p_tc
+    return score
 
-            p_td = answer_text_list.count(query_term) / answer_len
-            foreground_score = (1 - lambda_doc_level) * p_td
-            background_score = lambda_doc_level * p_tc
-            final_score_per_term = foreground_score + background_score
-            final_score_per_term = final_score_per_term + 0.0000000001
-            total_score_for_this_query_term_to_this_doc *= final_score_per_term
-        candidates_scores_doclevel[query][owner_incremental_id].append(
-            (answer_id, total_score_for_this_query_term_to_this_doc)
-        )
-        docs_score_with_owner_candidate_id[query].append(
-            (
-                answer_id,
-                total_score_for_this_query_term_to_this_doc,
-                owner_incremental_id,
-            )
-        )
+# 4. Rank Experts Based on Document Scores
+def rank_experts_doc_level(query, data, term_frequencies, total_terms, beta):
+    expert_scores = {}
 
-model2_doclevel_ranking_path = "model_two_doclevel_ranking.dict"
-with open(model2_doclevel_ranking_path, "w") as f:
-    json.dump(candidates_scores_doclevel, f, indent=4)
+    for question_id, content in data.items():
+        for answer in content["answers"]:
+            expert_id = answer["attorney_link"]
+            document = answer["answer_text"]
+            document_score = calculate_document_score(query, document, term_frequencies, total_terms, beta)
 
-model2_doclevel_scoreperdoc_ranking_path = (
-    "model_two_doclevel_score_perdoc_ranking.dict"
-)
-with open(model2_doclevel_scoreperdoc_ranking_path, "w") as f:
-    json.dump(docs_score_with_owner_candidate_id, f, indent=4)
+            if expert_id not in expert_scores:
+                expert_scores[expert_id] = []
+            expert_scores[expert_id].append(document_score)
+
+    # Aggregate scores per expert
+    expert_ranking = []
+    for expert_id, scores in expert_scores.items():
+        avg_score = sum(scores) / len(scores)
+        expert_ranking.append((expert_id, avg_score))
+
+    return sorted(expert_ranking, key=lambda x: x[1], reverse=True)
+
+# 5. Precision and MAP Calculations
+def calculate_precision_at_k(relevant_experts, ranking, k):
+    top_k = [expert_id for expert_id, _ in ranking[:k]]
+    relevant_in_top_k = sum(1 for expert in top_k if expert in relevant_experts)
+    return relevant_in_top_k / k if k > 0 else 0
+
+def calculate_map_mrr_and_precision(relevant_experts, ranking):
+    average_precision = 0
+    reciprocal_rank = 0
+    num_relevant_found = 0
+
+    for rank, (expert_id, _) in enumerate(ranking, 1):
+        if expert_id in relevant_experts:
+            num_relevant_found += 1
+            precision_at_k = num_relevant_found / rank
+            average_precision += precision_at_k
+
+            if reciprocal_rank == 0:
+                reciprocal_rank = 1 / rank
+
+    map_score = average_precision / len(relevant_experts) if relevant_experts else 0
+
+    # Calculate P@1, P@2, P@5
+    p1 = calculate_precision_at_k(relevant_experts, ranking, 1)
+    p2 = calculate_precision_at_k(relevant_experts, ranking, 2)
+    p5 = calculate_precision_at_k(relevant_experts, ranking, 5)
+
+    return map_score, reciprocal_rank, p1, p2, p5
+
+# 6. Extract Tags from CSV
+def extract_tags_from_csv(csv_file, min_occurrences=700):
+    tags = []
+    with open(csv_file, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if int(row["count_of_occurrences"]) > min_occurrences:
+                tags.append(row["stag_name"])
+    return tags
+
+# Main Function
+def main():
+    # File paths for JSON and CSV files
+    data_file_path = "/Users/arthurwunder/PycharmProjects/EF_in_Legal_CQA-ECIR2022/data/data_with_ids.json"
+    csv_file_path = "/Users/arthurwunder/PycharmProjects/EF_in_Legal_CQA-ECIR2022/data/all_tags_stat.csv"
+
+    # Load data and calculate term statistics
+    data, term_frequencies, total_terms, total_answers = load_and_calculate_statistics(data_file_path)
+    beta = total_terms / total_answers
+
+    # Extract tags
+    tags = extract_tags_from_csv(csv_file_path, min_occurrences=100)
+
+    # Filter tags that are actually in the JSON data
+    valid_tags = [tag for tag in tags if any(tag.lower() in [t.lower() for t in content.get("tags", [])] for content in data.values())]
+    print(f"Valid Tags: {valid_tags}")
+
+    # Aggregate metrics over all tags
+    total_map, total_mrr, total_p1, total_p2, total_p5 = 0, 0, 0, 0, 0
+    num_queries = 0
+
+    for tag in valid_tags:
+        print(f"\nProcessing Query: {tag}")
+
+        # Calculate Ground Truth
+        relevant_experts = calculate_ground_truth(data, category=tag)
+        print(f"Relevant Experts for '{tag}': {relevant_experts}")
+
+        if not relevant_experts:
+            print(f"No relevant experts for '{tag}'. Skipping...")
+            continue
+
+        # Rank experts
+        ranking = rank_experts_doc_level(tag, data, term_frequencies, total_terms, beta)
+
+        # Calculate MAP, MRR, and P@K
+        map_score, mrr_score, p1, p2, p5 = calculate_map_mrr_and_precision(relevant_experts, ranking)
+        print(f"MAP: {map_score:.4f}, MRR: {mrr_score:.4f}")
+        print(f"P@1: {p1:.4f}, P@2: {p2:.4f}, P@5: {p5:.4f}")
+
+        # Summing metrics
+        total_map += map_score
+        total_mrr += mrr_score
+        total_p1 += p1
+        total_p2 += p2
+        total_p5 += p5
+        num_queries += 1
+
+    # Calculate average metrics
+    if num_queries > 0:
+        avg_map = total_map / num_queries
+        avg_mrr = total_mrr / num_queries
+        avg_p1 = total_p1 / num_queries
+        avg_p2 = total_p2 / num_queries
+        avg_p5 = total_p5 / num_queries
+
+        print("\nAggregated Results:")
+        print(f"Average MAP: {avg_map:.4f}")
+        print(f"Average MRR: {avg_mrr:.4f}")
+        print(f"Average P@1: {avg_p1:.4f}")
+        print(f"Average P@2: {avg_p2:.4f}")
+        print(f"Average P@5: {avg_p5:.4f}")
+
+if __name__ == "__main__":
+    main()
