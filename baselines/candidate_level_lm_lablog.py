@@ -22,14 +22,28 @@ def load_and_aggregate_data(file_path):
 # 2. Calculate Ground Truth
 def calculate_ground_truth(data, category):
     relevant_experts = Counter()
+
     for question_id, content in data.items():
         if category.lower() in [tag.lower() for tag in content.get("tags", [])]:
             for answer in content["answers"]:
-                if answer.get("best_answer") or answer.get("lawyers_agreed", 0) >= 3:
-                    relevant_experts[answer["attorney_link"]] += 1
+                expert_id = answer["attorney_link"]
 
-    # Filter experts with at least 10 accepted answers
+                # Local engagement condition: at least 2 accepted answers
+                local_engagement = answer.get("best_answer") or answer.get("lawyers_agreed", 0) >= 3
+
+                # Local quality ratio (calculated based on upvotes and agreement)
+                local_quality_ratio = answer.get("lawyers_agreed", 0) > 3
+
+                # Quality condition: more high-quality answers than the average (e.g., based on lawyers_agreed)
+                quality = answer.get("lawyers_agreed", 0) > 0
+
+                # Check if all conditions are met
+                if local_engagement and local_quality_ratio and quality:
+                    relevant_experts[expert_id] += 1
+
+    # Filter experts with at least 10 relevant answers (or another threshold if needed)
     relevant_experts = [expert_id for expert_id, count in relevant_experts.items() if count >= 10]
+
     return relevant_experts
 
 # 3. Probability calculations
@@ -151,7 +165,7 @@ def main():
     expert_answers, data = load_and_aggregate_data(data_file_path)
 
     # Extract tags
-    tags = extract_tags_from_csv(csv_file_path, min_occurrences=100)
+    tags = extract_tags_from_csv(csv_file_path, min_occurrences=700)
 
     # Aggregate metrics over all tags
     total_map, total_mrr, total_p1, total_p2, total_p5 = 0, 0, 0, 0, 0
