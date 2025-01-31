@@ -2,6 +2,61 @@ import json
 import csv
 from collections import Counter
 import math
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+from nltk.tokenize import word_tokenize
+import nltk
+
+nltk.download('stopwords')
+nltk.download('punkt')
+
+# Initialize stopwords and stemmer
+stop_words = set(stopwords.words('english'))
+stemmer = PorterStemmer()
+
+# Globale Variablen zum Speichern der Ground Truth
+experts_by_tag = {}  # { "0": ["19", "25", ...], "4": [...], ... }
+tag_to_id = {}       # { "Divorce": "0", "Dividing debts in a divorce": "4", ... }
+
+
+# ---------------------------------------------------
+# 0. Hilfsfunktion: Lade Ground-Truth-Dateien
+# ---------------------------------------------------
+def load_ground_truth_files(tag_ids_path, selection_file):
+    """
+    Lädt:
+      - tagIDs.json (Dict: {"0": "Divorce", "4": "Dividing debts in a divorce", ...})
+      - selection_tags_lawyers_experts.json (NDJSON: pro Zeile {"tagID": "...", "lawyerID": "...", "expert": bool})
+    Schreibt in:
+      - experts_by_tag: Liste von Lawyer-IDs (Strings) je Tag-ID
+      - tag_to_id: Umkehrmapping von Tag-Name -> Tag-ID
+    """
+    global experts_by_tag, tag_to_id
+
+    # 1) Lade tagIDs.json
+    with open(tag_ids_path, "r") as f:
+        id_to_tag = json.load(f)  # z.B. {"0": "Divorce", "4": "Dividing debts in a divorce", ...}
+    # Umkehrmapping: "Divorce" -> "0", ...
+    tag_to_id = {v: k for k, v in id_to_tag.items()}
+
+    # 2) Lade selection_tags_lawyers_experts.json (NDJSON)
+    with open(selection_file, "r") as f:
+        for line in f:
+            record = json.loads(line.strip())
+            tID = record["tagID"]
+            lID = record["lawyerID"]
+            is_expert = record["expert"]
+            if is_expert:
+                if tID not in experts_by_tag:
+                    experts_by_tag[tID] = []
+                experts_by_tag[tID].append(lID)
+
+
+# Preprocess text (stopword removal and stemming)
+def preprocess_text(text):
+    tokens = word_tokenize(text.lower())
+    filtered_tokens = [stemmer.stem(word) for word in tokens if word.isalnum() and word not in stop_words]
+    return filtered_tokens
 
 # 1. Load data and aggregate answers by experts
 def load_and_aggregate_data(file_path):
@@ -13,6 +68,9 @@ def load_and_aggregate_data(file_path):
         for answer in content["answers"]:
             expert_id = answer["attorney_link"]
             answer_text = answer["answer_text"]
+            # Apply preprocessing if desired:
+            #answer_text = preprocess_text(answer_text)
+            #answer_text = " ".join(answer_text)
 
             if expert_id not in expert_answers:
                 expert_answers[expert_id] = []
@@ -20,52 +78,52 @@ def load_and_aggregate_data(file_path):
 
     return expert_answers, data
 
-# 2. Calculate Ground Truth
+# 2. Neue Ground-Truth-Funktion, die nur auf die geladenen Dateien zugreift
 def calculate_ground_truth(data, category):
-    relevant_experts = Counter()
+    """
+    Ermittelt relevante Experten anhand der zuvor geladenen Dateien:
+      - tagIDs.json
+      - selection_tags_lawyers_experts.json
+    'data' und 'category' bleiben im Funktionskopf, um den bestehenden Code unverändert zu lassen.
+    """
+    global experts_by_tag, tag_to_id
 
-    for question_id, content in data.items():
-        if category.lower() in [tag.lower() for tag in content.get("tags", [])]:
-            for answer in content["answers"]:
-                expert_id = answer["attorney_link"]
+    # Hole die zugehörige Tag-ID
+    tag_id = tag_to_id.get(category, None)
+    if tag_id is None:
+        # Tag nicht gefunden => Leere Liste
+        return []
 
-                # Local engagement condition: at least 2 accepted answers
-                local_engagement = answer.get("best_answer") or answer.get("lawyers_agreed", 0) >= 3
-
-                # Local quality ratio (calculated based on upvotes and agreement)
-                local_quality_ratio = answer.get("lawyers_agreed", 0) > 3
-
-                # Quality condition: more high-quality answers than the average (e.g., based on lawyers_agreed)
-                quality = answer.get("lawyers_agreed", 0) > 0
-
-                # Check if all conditions are met
-                if local_engagement and local_quality_ratio and quality:
-                    relevant_experts[expert_id] += 1
-
-    # Filter experts with at least 10 relevant answers (or another threshold if needed)
-    relevant_experts = [expert_id for expert_id, count in relevant_experts.items() if count >= 10]
-
-    return relevant_experts
+    # Liefere alle Lawyer-IDs, die in selection_tags_lawyers_experts.json als "expert":true markiert sind
+    return experts_by_tag.get(tag_id, [])
 
 # 3. BM25 calculations
-def calculate_bm25_score(query, document, term_frequencies, total_documents, avg_doc_length, k1=3, b=0.5):
+def calculate_bm25_score(query, document, term_frequencies, total_documents, avg_doc_length, k1=1.5, b=0.75):
     words = document.split()
     doc_length = len(words)
     score = 0
 
-    for term in query.split():
+    # Preprocessing nur für den Query
+    query_terms = preprocess_text(query)
+    for term in query_terms:
         term_frequency = words.count(term)
         if term_frequency == 0:
             continue
 
-        idf = math.log((total_documents + 0.5) / (term_frequencies.get(term, 0) + 0.5) + 1)  # Adjusted IDF weighting
-        term_score = idf * (term_frequency * (k1 + 1)) / (term_frequency + k1 * (1 - b + b * (doc_length / avg_doc_length)))
+        # IDF nach BM25
+        idf = math.log((total_documents - term_frequencies.get(term, 0) + 0.5) /
+                       (term_frequencies.get(term, 0) + 0.5) + 1)
+
+        # Rechenformel BM25
+        term_score = idf * (term_frequency * (k1 + 1)) / \
+                     (term_frequency + k1 * (1 - b + b * (doc_length / avg_doc_length)))
         score += term_score
 
     return score
 
 # Rank experts using BM25
 def rank_experts_bm25(query, expert_answers):
+    # Gesamten Text für Frequenzstatistik zusammenfassen
     all_texts = " ".join([" ".join(answers) for answers in expert_answers.values()])
     all_words = all_texts.split()
     term_frequencies = Counter(all_words)
@@ -77,7 +135,8 @@ def rank_experts_bm25(query, expert_answers):
         expert_score = 0
         for answer in answers:
             expert_score += calculate_bm25_score(query, answer, term_frequencies, total_documents, avg_doc_length)
-        ranking.append((expert_id, expert_score / len(answers)))  # Normalize by number of answers
+        # Normalisierung durch Anzahl der Antworten
+        ranking.append((expert_id, expert_score / len(answers)))
 
     ranking = sorted(ranking, key=lambda x: x[1], reverse=True)
     return ranking
@@ -106,7 +165,7 @@ def calculate_map_mrr_and_precision(relevant_experts, ranking):
             precision_at_k = num_relevant_found / rank
             average_precision += precision_at_k
 
-            if reciprocal_rank == 0:  # First relevant expert
+            if reciprocal_rank == 0:  # First relevant expert found
                 reciprocal_rank = 1 / rank
 
     map_score = average_precision / len(relevant_experts) if relevant_experts else 0
@@ -130,39 +189,47 @@ def extract_tags_from_csv(csv_file, min_occurrences=700):
 
 # Main function
 def main():
-    # File paths for JSON and CSV files
-    data_file_path = "/Users/arthurwunder/PycharmProjects/EF_in_Legal_CQA-ECIR2022/data/data_with_ids.json"
-    csv_file_path = "/Users/arthurwunder/PycharmProjects/EF_in_Legal_CQA-ECIR2022/data/all_tags_stat.csv"
+    # Relative/Absolute file paths for JSON and CSV files
+    data_file_path = "../data/data_with_ids.json"
+    csv_file_path = "../data/all_tags_stat.csv"
 
-    # Load data
+    # Dateien für die Ground Truth
+    tag_ids_path = "../data/tagIDs.json"
+    selection_experts_path = "../data/selection_tags_lawyers_experts.json"
+
+    print("Program started")
+
+    # 0. Ground-Truth-Dateien laden
+    load_ground_truth_files(tag_ids_path, selection_experts_path)
+
+    # 1. Daten für das Ranking laden
     expert_answers, data = load_and_aggregate_data(data_file_path)
 
-    # Extract tags
+    # 2. Relevante Tags aus CSV extrahieren
     tags = extract_tags_from_csv(csv_file_path, min_occurrences=700)
 
-    # Aggregate metrics over all tags
+    # 3. Aggregate metrics over all tags
     total_map, total_mrr, total_p1, total_p2, total_p5 = 0, 0, 0, 0, 0
     num_queries = 0
 
     for tag in tags:
         print(f"\nProcessing Query: {tag}")
 
-        # Calculate Ground Truth
+        # Ground Truth aus den JSON-Dateien
         relevant_experts = calculate_ground_truth(data, category=tag)
         print(f"Relevant Experts for '{tag}': {relevant_experts}")
 
-        # Rank experts using BM25
+        # BM25-Ranking
         ranking = rank_experts_bm25(tag, expert_answers)
 
-        # Display results
+        # Anzeige
         display_ranking(ranking)
 
-        # Calculate MAP, MRR, and P@K
+        # Metriken
         map_score, mrr_score, p1, p2, p5 = calculate_map_mrr_and_precision(relevant_experts, ranking)
         print(f"MAP: {map_score:.4f}, MRR: {mrr_score:.4f}")
         print(f"P@1: {p1:.4f}, P@2: {p2:.4f}, P@5: {p5:.4f}")
 
-        # Summing metrics
         total_map += map_score
         total_mrr += mrr_score
         total_p1 += p1
@@ -170,7 +237,7 @@ def main():
         total_p5 += p5
         num_queries += 1
 
-    # Calculate average metrics
+    # 4. Durchschn. Ergebnisse berechnen
     if num_queries > 0:
         avg_map = total_map / num_queries
         avg_mrr = total_mrr / num_queries
